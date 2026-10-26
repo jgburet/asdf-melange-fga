@@ -2,10 +2,12 @@
 
 set -euo pipefail
 
-# TODO: Ensure this is the correct GitHub homepage where releases can be downloaded for melange-fga.
 GH_REPO="https://github.com/pthm/melange"
 TOOL_NAME="melange-fga"
 TOOL_TEST="melange version"
+
+# Tagged releases published without binaries.
+VERSIONS_WITHOUT_ASSETS=(0.1.0 0.2.0 0.3.0 0.6.1 0.6.6)
 
 fail() {
 	echo -e "asdf-$TOOL_NAME: $*"
@@ -14,7 +16,6 @@ fail() {
 
 curl_opts=(-fsSL)
 
-# NOTE: You might want to remove this if melange-fga is not hosted on GitHub releases.
 if [ -n "${GITHUB_API_TOKEN:-}" ]; then
 	curl_opts=("${curl_opts[@]}" -H "Authorization: token $GITHUB_API_TOKEN")
 fi
@@ -24,16 +25,43 @@ sort_versions() {
 		LC_ALL=C sort -t. -k 1,1 -k 2,2n -k 3,3n -k 4,4n -k 5,5n | awk '{print $2}'
 }
 
+# The repository is a Go multi-module workspace: besides release tags (vX.Y.Z),
+# it carries per-module tags (cmd/..., melange/..., tooling/...) that are not releases.
 list_github_tags() {
 	git ls-remote --tags --refs "$GH_REPO" |
 		grep -o 'refs/tags/.*' | cut -d/ -f3- |
-		sed 's/^v//' # NOTE: You might want to adapt this sed to remove non-version strings from tags
+		grep -E '^v[0-9]+\.[0-9]+\.[0-9]+' |
+		sed 's/^v//'
 }
 
 list_all_versions() {
-	# TODO: Adapt this. By default we simply list the tag names from GitHub releases.
-	# Change this function if melange-fga has other means of determining installable versions.
-	list_github_tags
+	list_github_tags | grep -vxF "$(printf "%s\n" "${VERSIONS_WITHOUT_ASSETS[@]}")"
+}
+
+get_platform() {
+	local platform
+	platform="$(uname -s | tr '[:upper:]' '[:lower:]')"
+
+	case "$platform" in
+	darwin | linux) echo "$platform" ;;
+	*) fail "Unsupported platform: $platform" ;;
+	esac
+}
+
+get_arch() {
+	local arch
+	arch="$(uname -m)"
+
+	case "$arch" in
+	x86_64 | amd64) echo "amd64" ;;
+	aarch64 | arm64) echo "arm64" ;;
+	*) fail "Unsupported architecture: $arch" ;;
+	esac
+}
+
+get_asset_name() {
+	local version="$1"
+	echo "melange_${version}_$(get_platform)_$(get_arch).tar.gz"
 }
 
 download_release() {
@@ -41,34 +69,62 @@ download_release() {
 	version="$1"
 	filename="$2"
 
-	# TODO: Adapt the release URL convention for melange-fga
-	url="$GH_REPO/archive/v${version}.tar.gz"
+	url="$GH_REPO/releases/download/v${version}/$(get_asset_name "$version")"
 
 	echo "* Downloading $TOOL_NAME release $version..."
 	curl "${curl_opts[@]}" -o "$filename" -C - "$url" || fail "Could not download $url"
 }
 
+sha256() {
+	if command -v sha256sum >/dev/null 2>&1; then
+		sha256sum "$1" | cut -d' ' -f1
+	elif command -v shasum >/dev/null 2>&1; then
+		shasum -a 256 "$1" | cut -d' ' -f1
+	else
+		fail "Neither sha256sum nor shasum is available to verify the download."
+	fi
+}
+
+verify_release() {
+	local version filename asset url expected actual
+	version="$1"
+	filename="$2"
+	asset="$(get_asset_name "$version")"
+	url="$GH_REPO/releases/download/v${version}/checksums.txt"
+
+	echo "* Verifying checksum..."
+	expected="$(curl "${curl_opts[@]}" "$url" | awk -v asset="$asset" '$2 == asset { print $1 }')" ||
+		fail "Could not download $url"
+	[ -n "$expected" ] || fail "No checksum found for $asset in $url"
+
+	actual="$(sha256 "$filename")"
+	[ "$expected" = "$actual" ] || fail "Checksum mismatch for $asset: expected $expected, got $actual"
+}
+
 install_version() {
 	local install_type="$1"
 	local version="$2"
-	local install_path="${3%/bin}/bin"
+	local install_root="${3%/bin}"
+	local install_path="$install_root/bin"
 
 	if [ "$install_type" != "version" ]; then
 		fail "asdf-$TOOL_NAME supports release installs only"
 	fi
 
 	(
-		mkdir -p "$install_path"
-		cp -r "$ASDF_DOWNLOAD_PATH"/* "$install_path"
-
-		# TODO: Assert melange-fga executable exists.
 		local tool_cmd
 		tool_cmd="$(echo "$TOOL_TEST" | cut -d' ' -f1)"
+
+		# Only the binary goes in bin/ so asdf does not shim LICENSE, README.md, etc.
+		mkdir -p "$install_path"
+		cp -r "$ASDF_DOWNLOAD_PATH"/* "$install_root"
+		mv "$install_root/$tool_cmd" "$install_path/$tool_cmd"
+
 		test -x "$install_path/$tool_cmd" || fail "Expected $install_path/$tool_cmd to be executable."
 
 		echo "$TOOL_NAME $version installation was successful!"
 	) || (
-		rm -rf "$install_path"
+		rm -rf "$install_root"
 		fail "An error occurred while installing $TOOL_NAME $version."
 	)
 }
